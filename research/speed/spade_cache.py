@@ -55,8 +55,9 @@ def aspade_ref(Yb, LBb, UBb, A, As, s, r, eps, max_iter, M, rank_w, pad_multiple
 def constraints(y, sr, device):
     lsb = estimate_lsb(y)
 
-    def run_fast(yy, cons):
-        return declip(yy, sr, models=[("nmf", 93, dict(n_iter=80))], constraints=cons, verbose=False, device=device)[0]
+    def run_fast(items):
+        return [declip(yy, sr, models=[("nmf", 93, dict(n_iter=80))], constraints=cons, verbose=False, device=device)[0]
+                for yy, cons in items]
     m_hi, m_lo, th_hi, th_lo, rep = A_.auto_constraints(y, lsb, run_fast, mode="auto", sr=sr)
     return m_hi, m_lo, th_hi, th_lo, rep["mode"]
 

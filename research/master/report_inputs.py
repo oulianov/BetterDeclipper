@@ -33,9 +33,9 @@ def report(fn):
     lsb = estimate_lsb(y)
     t0 = time.time()
 
-    def run_fast(yy, cons):
-        xx, _ = declip(yy, sr, models=[("nmf", 93, dict(n_iter=80))], constraints=cons, verbose=False)
-        return xx
+    def run_fast(items):
+        return [declip(yy, sr, models=[("nmf", 93, dict(n_iter=80))], constraints=cons, verbose=False)[0]
+                for yy, cons in items]
     m_hi, m_lo, th_hi, th_lo, rep = A.auto_constraints(y, lsb, run_fast, mode="auto", sr=sr)
     print(f"== {os.path.basename(fn)}  {sr} Hz {C} ch {T/sr:.0f} s lsb {lsb:.1e}  -> {rep['mode']}  "
           f"flagged {(m_hi | m_lo).mean()*100:.2f}%  ({time.time()-t0:.0f}s)")

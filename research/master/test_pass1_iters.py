@@ -12,9 +12,9 @@ for key in cases:
     lsb = estimate_lsb(y)
     out = []
     for it in (150, 80, 40):
-        def run_fast(yy, cons, it=it):
-            xx, _ = declip(yy, sr, models=[("nmf", 93, dict(n_iter=it))], constraints=cons, verbose=False)
-            return xx
+        def run_fast(items, it=it):
+            return [declip(yy, sr, models=[("nmf", 93, dict(n_iter=it))], constraints=cons, verbose=False)[0]
+                    for yy, cons in items]
         _, _, _, _, rep = A.auto_constraints(y, lsb, run_fast, mode="auto", sr=sr)
         out.append(f"it{it}: {rep['mode']}")
     print(f"{key:20s} " + " | ".join(out), flush=True)

@@ -284,11 +284,8 @@ def search_shoulder(y, lsb, refs, run_fast, sr=44100):
     if not any(r["theta"] is not None for row in refs for r in row):
         return dict(knee=None, acc=None, acc_min=acc_min, curve=None)
     k0 = [[RAISE_K0 * r["theta"] if r["theta"] else None for r in row] for row in refs]
-    ys, xs = [], []
-    for a, b in _loud_windows(y, refs, sr):   # long files: first pass on the loudest 60 s only
-        yw = y[a:b]
-        ys.append(yw)
-        xs.append(run_fast(yw, ceiling_constraints(yw, refs, k0, lsb)))
+    ys = [y[a:b] for a, b in _loud_windows(y, refs, sr)]   # long files: first pass on the loudest 60 s only
+    xs = run_fast([(yw, ceiling_constraints(yw, refs, k0, lsb)) for yw in ys])
     cur = raise_curve(np.concatenate(ys), np.concatenate(xs), refs)
     return dict(knee=knee_from_raise(cur, acc_min=acc_min), acc=lift_acceleration(cur), acc_min=acc_min,
                 curve=[None if not np.isfinite(v) else float(v) for v in cur])
@@ -352,7 +349,8 @@ def load_analysis(path):
 
 def auto_constraints(y, lsb, run_fast, mode="auto", sr=44100, analysis=None, search=False):
     """Analyze the ceilings (or use a saved `analysis`) and build the constraint set of `mode`.
-    run_fast(y, constraints) -> x runs a quick restoration (soft-shoulder search); search=True runs the
+    run_fast([(y, constraints), ...]) -> [x, ...] runs quick restorations of the loudest windows
+    (soft-shoulder search); search=True runs the
     search even in mode 'hard', so the analysis in the report is complete for reuse with any mode.
     Returns (m_hi, m_lo, th_hi, th_lo, report dict); report['data'] is the reusable analysis.
 

@@ -217,7 +217,7 @@ def main(argv=None):
         print("no clipping or limiting detected; output equals input (use --mode soft, --knee or --clip-level to force it)")
     x = x * 10 ** (args.gain / 20)
     if args.limit is not None:
-        x, reduction = limit_true_peak(x, sr, ceiling_db=args.limit)
+        x, reduction = limit_true_peak(x, sr, ceiling_db=args.limit, device=info["device"])
         print(f"true-peak limiter: ceiling {args.limit:+.2f} dBTP, max gain reduction {reduction:.2f} dB")
     peak = np.abs(x).max()
     if args.normalize is not None and peak > 0:

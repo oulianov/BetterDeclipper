@@ -14,8 +14,9 @@ if __name__ == "__main__":
         lsb = estimate_lsb(y)
         t0 = time.time()
 
-        def run_fast(yy, cons):
-            return declip(yy, sr, models=[("nmf", 93, dict(n_iter=80))], constraints=cons, verbose=False)[0]
+        def run_fast(items):
+            return [declip(yy, sr, models=[("nmf", 93, dict(n_iter=80))], constraints=cons, verbose=False)[0]
+                    for yy, cons in items]
         m_hi, m_lo, _, _, rep = A.auto_constraints(y, lsb, run_fast, mode="auto", sr=sr)
         kinds = "".join(r["kind"][0] for row in rep["refs"] for r in row)
         acc = rep.get("acc")

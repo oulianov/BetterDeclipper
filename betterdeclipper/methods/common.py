@@ -66,16 +66,29 @@ class ChannelMix:
     """Orthogonal channel mixing x = Q u (and u = Q^T x) along a channel axis.
 
     For 2 channels this is 4 scalar multiply-adds per sample; einsum would dispatch a batched
-    matmul with an inner dimension of 2, which is very slow on GPUs."""
+    matmul with an inner dimension of 2, which is very slow on GPUs.
+    Q may also be (B, C, C), one matrix per signal of a batch: tensors (B, C, ...) are then mixed along
+    dim 1, with the matrices kept on `device` (usable inside CUDA graphs)."""
 
-    def __init__(self, Q):
+    def __init__(self, Q, device="cpu", dtype=torch.float32):
         self.Qn = np.asarray(Q, dtype=np.float64)
-        self.C = self.Qn.shape[0]
+        self.C = self.Qn.shape[-1]
         self.identity = bool(np.allclose(self.Qn, np.eye(self.C)))
+        if self.Qn.ndim == 3:
+            Qt = torch.as_tensor(self.Qn, dtype=dtype, device=device)
+            self.M, self.Mt = Qt, Qt.transpose(1, 2)
+        else:
+            self.M, self.Mt = self.Qn, self.Qn.T
 
     def _apply(self, M, x, dim):
         if self.identity:
             return x
+        if isinstance(M, torch.Tensor):  # per-signal matrices (B, C, C), x (B, C, ...)
+            M = M.reshape(*M.shape, *(1,) * (x.ndim - 2))
+            if self.C == 2:
+                x0, x1 = x[:, 0], x[:, 1]
+                return torch.stack([x0 * M[:, 0, 0] + x1 * M[:, 0, 1], x0 * M[:, 1, 0] + x1 * M[:, 1, 1]], 1)
+            return (M * x[:, None]).sum(2)
         if self.C == 2:
             x0, x1 = x.select(dim, 0), x.select(dim, 1)
             y0 = x0 * float(M[0, 0]) + x1 * float(M[0, 1])
@@ -86,11 +99,11 @@ class ChannelMix:
 
     def mix(self, u, dim=0):
         """x = Q u"""
-        return self._apply(self.Qn, u, dim)
+        return self._apply(self.M, u, dim)
 
     def unmix(self, x, dim=0):
         """u = Q^T x"""
-        return self._apply(self.Qn.T, x, dim)
+        return self._apply(self.Mt, x, dim)
 
 
 class DipProj:

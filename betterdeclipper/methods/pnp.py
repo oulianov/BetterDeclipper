@@ -10,6 +10,8 @@ Options:
  - fweight: frequency-dependent lambda ~ (f/f0)^fweight.
  - pilot: a previous estimate whose smoothed TF energy is used (mixed with the current energy
    by `pilot_mix`) in the Wiener gain -> BM3D-like second stage.
+
+Signals are solved as a batch (B, C, T): one call can solve several equally long signals at once.
 """
 import math
 import os
@@ -23,6 +25,13 @@ import torch.nn.functional as Fnn
 from ..stft import TightSTFT
 from .common import make_bounds, pad_bounds, Box, threshold_scale, ChannelMix, DipProj
 from .social import _neigh_kernel, channel_mixing
+
+
+def _tf_smooth(a2, kernel):
+    """(..., F, K) energies smoothed over a time-frequency neighborhood kernel (1, 1, kt, kf)."""
+    kt, kf = kernel.shape[-2:]
+    e = Fnn.conv2d(a2.reshape(-1, 1, *a2.shape[-2:]), kernel, padding=(kt // 2, kf // 2))
+    return e.reshape(a2.shape)
 
 
 class PEWDenoiser:
@@ -42,17 +51,14 @@ class PEWDenoiser:
         return self  # stateless between calls
 
     def energy(self, a2):
-        es = []
-        for k in self.kernels:
-            kt, kf = k.shape[-2:]
-            es.append(Fnn.conv2d(a2[:, None], k, padding=(kt // 2, kf // 2))[:, 0])
+        es = [_tf_smooth(a2, k) for k in self.kernels]
         if len(es) == 1:
             return es[0]
         e = torch.stack(es, 0)
         return e.max(0).values if self.combine == "max" else e.mean(0)
 
     def __call__(self, x, lam2):
-        """lam2: squared threshold (Python float, or a 0-dim tensor inside CUDA graphs)."""
+        """x: (B, C, Tp). lam2: squared threshold per signal ((B, 1, 1, 1) tensor)."""
         Tp = x.shape[-1]
         out = torch.zeros_like(x)
         if self.chan_gain is not None:
@@ -77,7 +83,7 @@ class PEWDenoiser:
 
 class NMFDenoiser:
     """Wiener-type shrinkage whose signal power comes from a low-rank NMF model of the current
-    iterate's power spectrogram (templates shared by all channels, warm-started across calls).
+    iterate's power spectrogram (templates shared by all channels of a signal, warm-started across calls).
     gain_mode 'wiener': V/(V+lam^2); 'pew': max(0, 1 - lam^2/V)."""
 
     def __init__(self, stft, rank=32, nmf_iter=2, beta=1.0, gain_mode="wiener", smooth_mix=0.0,
@@ -102,31 +108,32 @@ class NMFDenoiser:
         return self
 
     def _fit(self, P, n_iter):
+        """P: (B, N, K) power spectrogram rows of each signal; templates W (B, K, rank), activations H (B, N, rank)."""
         eps = 1e-12
         if self.W is None:
             g = torch.Generator().manual_seed(0)
-            N, K = P.shape
-            m = P.mean()
-            self.W = (torch.rand(K, self.rank, generator=g, dtype=self.dtype) + 0.1).to(self.device) * torch.sqrt(m)
-            self.H = (torch.rand(N, self.rank, generator=g, dtype=self.dtype) + 0.1).to(self.device) * torch.sqrt(m)
+            B, N, K = P.shape
+            m = torch.sqrt(P.mean((1, 2), keepdim=True))
+            self.W = (torch.rand(K, self.rank, generator=g, dtype=self.dtype) + 0.1).to(self.device) * m
+            self.H = (torch.rand(N, self.rank, generator=g, dtype=self.dtype) + 0.1).to(self.device) * m
             self._V = None
         W, H, b = self.W, self.H, self.beta
         for i in range(n_iter):
             # H, W are unchanged since the previous call returned H @ W.T, so reuse it (exact)
-            V = self._V if (i == 0 and self._V is not None) else H @ W.T + eps
-            if b == 1.0:  # KL: denominators are column sums (ones @ W == W.sum(0))
-                H = H * ((P / V) @ W) / (W.sum(0, keepdim=True) + eps)
-                V = H @ W.T + eps
-                W = W * ((P / V).T @ H) / (H.sum(0, keepdim=True) + eps)
+            V = self._V if (i == 0 and self._V is not None) else H @ W.mT + eps
+            if b == 1.0:  # KL: denominators are column sums (ones @ W == W.sum over K)
+                H = H * ((P / V) @ W) / (W.sum(1, keepdim=True) + eps)
+                V = H @ W.mT + eps
+                W = W * ((P / V).mT @ H) / (H.sum(1, keepdim=True) + eps)
             else:
                 H = H * ((V ** (b - 2) * P) @ W) / ((V ** (b - 1)) @ W + eps)
-                V = H @ W.T + eps
-                W = W * ((V ** (b - 2) * P).T @ H) / ((V ** (b - 1)).T @ H + eps)
+                V = H @ W.mT + eps
+                W = W * ((V ** (b - 2) * P).mT @ H) / ((V ** (b - 1)).mT @ H + eps)
             # normalize templates (scale into activations)
-            s = W.sum(0, keepdim=True) + eps
+            s = W.sum(1, keepdim=True) + eps
             W = W / s
             H = H * s
-        V = H @ W.T
+        V = H @ W.mT
         if self.static:
             self.W.copy_(W)
             self.H.copy_(H)
@@ -137,17 +144,15 @@ class NMFDenoiser:
         return V
 
     def __call__(self, x, lam2):
-        """lam2: squared threshold (Python float, or a 0-dim tensor inside CUDA graphs)."""
+        """x: (B, C, Tp). lam2: squared threshold per signal ((B, 1, 1, 1) tensor)."""
         Tp = x.shape[-1]
         z = self.stft.analysis(x)
-        C, F, K = z.shape
+        B, C, F, K = z.shape
         a2 = z.real ** 2 + z.imag ** 2
         n_it = self.nmf_iter if self.W is not None else 50
-        V = self._fit(a2.reshape(C * F, K), n_it).reshape(C, F, K)
+        V = self._fit(a2.reshape(B, C * F, K), n_it).reshape(B, C, F, K)
         if self.smooth_mix > 0 and self.pew_kernel is not None:
-            kt, kf = self.pew_kernel.shape[-2:]
-            E = Fnn.conv2d(a2[:, None], self.pew_kernel, padding=(kt // 2, kf // 2))[:, 0]
-            V = (1 - self.smooth_mix) * V + self.smooth_mix * E
+            V = (1 - self.smooth_mix) * V + self.smooth_mix * _tf_smooth(a2, self.pew_kernel)
         if self.chan_gain is not None:
             lam2 = lam2 * self.chan_gain ** 2
         if self.gain_mode == "wiener":
@@ -164,35 +169,41 @@ def declip_pnp(y, m_hi, m_lo, th_hi, th_lo, sr=44100, win_len=4096, hop=1024, ne
                device="cpu", dtype=torch.float32, callback=None, x_init=None, lam_ref=None,
                den_type="pew", nmf_rank=32, nmf_iter=2, nmf_beta=1.0, nmf_smooth=0.0, nmf_rank_ratio=None,
                max_gain=None, dips=None):
-    T, C = y.shape
-    scale = threshold_scale(th_hi, th_lo)
-    lb, ub = make_bounds(y / scale, m_hi, m_lo, th_hi / scale, th_lo / scale, max_gain)
+    """Declip y (T, C). Batch: lists of equally long signals for y, m_hi, m_lo, th_hi, th_lo (and lam_ref,
+    max_gain when given) are solved together, each with its own scale, channel rotation, lambda schedule
+    and NMF factors: the same estimates as one call per signal (returned as a list), in one GPU solve."""
+    batch = isinstance(y, (list, tuple))
+    if not batch:
+        y, m_hi, m_lo, th_hi, th_lo, lam_ref, max_gain = [y], [m_hi], [m_lo], [th_hi], [th_lo], [lam_ref], [max_gain]
+    elif pilot is not None or x_init is not None or dips is not None or callback is not None:
+        raise ValueError("pilot, x_init, dips and callback need a single signal")
+    B = len(y)
+    T, C = y[0].shape
+    lam_ref = lam_ref if lam_ref is not None else [None] * B
+    max_gain = max_gain if max_gain is not None else [None] * B
+    scale = np.array([threshold_scale(a, b) for a, b in zip(th_hi, th_lo)])
     stft = TightSTFT(win_len, hop, None, device, dtype)
     left, right = stft.pad_len(T)
-    # extra right padding so that circular shifts only wrap free (padded) samples
+    # extra right padding so that circular shifts only wrap free (padded) samples, then to whole hops
     right += win_len
-    lb, ub = pad_bounds(lb, ub, left, right)
-    Tp = lb.shape[1]
-    rem = (Tp - win_len) % hop
-    if rem:
-        extra = hop - rem
-        lb = np.concatenate([lb, np.full((C, extra), -np.inf)], 1)
-        ub = np.concatenate([ub, np.full((C, extra), np.inf)], 1)
-        Tp += extra
-    proj = Box(lb, ub, device, dtype)
+    right += (hop - (T + left + right - win_len) % hop) % hop
+    Tp = T + left + right
+    lb, ub = zip(*(pad_bounds(*make_bounds(yb / s, mh, ml, th / s, tl / s, mg), left, right)
+                   for yb, mh, ml, th, tl, mg, s in zip(y, m_hi, m_lo, th_hi, th_lo, max_gain, scale)))
+    proj = Box(np.stack(lb), np.stack(ub), device, dtype)
     if dips is not None:  # limiter restoration: (idx (T, C) event ids or -1, v (T, C) dip shape, n_events, bmax)
         didx, dv, n_ev, bmax = dips
-        ip = np.full((C, Tp), -1, dtype=np.int64); ip[:, left:left + T] = didx.T
-        vp = np.zeros((C, Tp)); vp[:, left:left + T] = dv.T
-        yp = np.zeros((C, Tp)); yp[:, left:left + T] = y.T / scale
+        ip = np.full((1, C, Tp), -1, dtype=np.int64); ip[0, :, left:left + T] = didx.T
+        vp = np.zeros((1, C, Tp)); vp[0, :, left:left + T] = dv.T
+        yp = np.zeros((1, C, Tp)); yp[0, :, left:left + T] = y[0].T / scale[0]
         proj = DipProj(proj, torch.as_tensor(yp, dtype=dtype, device=device), torch.as_tensor(ip, device=device),
                        torch.as_tensor(vp, dtype=dtype, device=device), n_ev, bmax)
-    cm = ChannelMix(channel_mixing(y, stereo))
+    cm = ChannelMix(np.stack([channel_mixing(yb, stereo) for yb in y]), device, dtype)
     mix, unmix = cm.mix, cm.unmix
 
-    def to_pad(a):
-        v = torch.zeros(C, Tp, dtype=dtype, device=device)
-        v[:, left:left + T] = torch.as_tensor(a.T / scale, dtype=dtype, device=device)
+    def to_pad(a):  # list of (T, C) signals -> (B, C, Tp) normalized and padded
+        v = torch.zeros(len(a), C, Tp, dtype=dtype, device=device)
+        v[:, :, left:left + T] = torch.as_tensor(np.stack([ab.T / s for ab, s in zip(a, scale)]), dtype=dtype, device=device)
         return v
 
     fw = None
@@ -211,18 +222,21 @@ def declip_pnp(y, m_hi, m_lo, th_hi, th_lo, sr=44100, win_len=4096, hop=1024, ne
     else:
         den = PEWDenoiser(stft, neighs or [neigh], device, dtype, shifts, combine, chan_gain, fw, None, pilot_mix, gain_mode)
     if pilot is not None:
-        pu = unmix(to_pad(pilot))
+        pu = unmix(to_pad([pilot]))
         pe = []
         for s in den.shifts:
             zp = stft.analysis(torch.roll(pu, -s, dims=-1) if s else pu)
             pe.append(den.energy(zp.real ** 2 + zp.imag ** 2))
         den.pilot_e = pe
 
-    x0 = to_pad(y if x_init is None else x_init)
+    x0 = to_pad(y if x_init is None else [x_init])
     # lambda reference: max |coefficient| of the (normalized) clipped signal; pass lam_ref to use a
     # file-global value so that chunks of a long file share the same schedule
-    zmax = lam_ref if lam_ref is not None else float(torch.abs(stft.analysis(unmix(to_pad(y)))).max())
-    lam2s = [float(l) ** 2 for l in np.geomspace(lam0 * zmax, lam1 * zmax, n_iter)]
+    if any(r is None for r in lam_ref):
+        zy = torch.abs(stft.analysis(unmix(to_pad(y)))).amax((1, 2, 3)).tolist()
+        lam_ref = [z if r is None else r for r, z in zip(lam_ref, zy)]
+    lam2s = np.stack([np.geomspace(lam0 * float(z), lam1 * float(z), n_iter) ** 2 for z in lam_ref], 1)
+    lam2s = torch.as_tensor(lam2s, dtype=dtype, device=device).reshape(n_iter, B, 1, 1, 1)
     coefs = []  # FISTA momentum coefficients (t_k - 1) / t_{k+1}
     t = 1.0
     for _ in range(n_iter):
@@ -243,9 +257,9 @@ def declip_pnp(y, m_hi, m_lo, th_hi, th_lo, sr=44100, win_len=4096, hop=1024, ne
     if x is None:
         x = _solve_eager(x0, lam2s, coefs, proj, mix, unmix, den, relax,
                          None if callback is None else (lambda it, xx: callback(
-                             it, proj(xx)[:, left:left + T].T.cpu().numpy().astype(np.float64) * scale)))
-    x = proj(x)
-    return x[:, left:left + T].T.cpu().numpy().astype(np.float64) * scale
+                             it, proj(xx)[0, :, left:left + T].T.cpu().numpy().astype(np.float64) * scale[0])))
+    x = proj(x)[:, :, left:left + T].transpose(1, 2).cpu().numpy().astype(np.float64) * scale[:, None, None]
+    return list(x) if batch else x[0]
 
 
 def _solve_eager(x, lam2s, coefs, proj, mix, unmix, den, relax=1.0, callback=None):
@@ -265,11 +279,11 @@ def _solve_eager(x, lam2s, coefs, proj, mix, unmix, den, relax=1.0, callback=Non
 def _solve_graph(x, lam2s, coefs, proj, mix, unmix, den):
     """Same iterations as _solve_eager, but one iteration is captured as a CUDA graph and replayed:
     the ~60 small kernel launches per iteration otherwise dominate on slower host CPUs.
-    State lives in static buffers updated in place; lambda^2 and the momentum coefficient are 0-dim
-    device tensors refreshed before each replay."""
+    State lives in static buffers updated in place; lambda^2 (per signal) and the momentum coefficient
+    are device tensors refreshed before each replay."""
     x_s = x.clone()
     xbar_s = x.clone()
-    lam2_t = torch.zeros((), dtype=x.dtype, device=x.device)
+    lam2_t = lam2s[0].clone()
     c_t = torch.zeros((), dtype=x.dtype, device=x.device)
 
     def step():
@@ -280,7 +294,7 @@ def _solve_graph(x, lam2s, coefs, proj, mix, unmix, den):
 
     n = len(lam2s)
     # iteration 0 eagerly: the NMF denoiser initializes its factors on the first call
-    lam2_t.fill_(lam2s[0]); c_t.fill_(coefs[0])
+    c_t.fill_(coefs[0])
     step()
     if hasattr(den, "static"):
         den.static = True
@@ -289,13 +303,13 @@ def _solve_graph(x, lam2s, coefs, proj, mix, unmix, den):
     side.wait_stream(torch.cuda.current_stream(x.device))
     with torch.cuda.stream(side):
         for it in (1, 2):
-            lam2_t.fill_(lam2s[it]); c_t.fill_(coefs[it])
+            lam2_t.copy_(lam2s[it]); c_t.fill_(coefs[it])
             step()
     torch.cuda.current_stream(x.device).wait_stream(side)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         step()  # recorded, not executed
     for it in range(3, n):
-        lam2_t.fill_(lam2s[it]); c_t.fill_(coefs[it])
+        lam2_t.copy_(lam2s[it]); c_t.fill_(coefs[it])
         graph.replay()
     return x_s

@@ -1,6 +1,6 @@
 """Parseval tight-frame STFT (Hann window, overlap-add) implemented with torch.
 
-analysis(x) -> complex coefficients (B, F, K); synthesis(c) -> time signal (B, T).
+analysis(x) -> complex coefficients (..., F, K); synthesis(c) -> time signal (..., T).
 synthesis(analysis(x)) == x exactly (up to float error) on the padded signal, and
 ||analysis(x)||^2 == ||x||^2 when the rfft bins are weighted (interior bins count twice).
 """
@@ -37,25 +37,25 @@ class TightSTFT:
         return left, right
 
     def analysis(self, x):
-        """x: (B, Tp) padded signal -> (B, F, K) complex."""
+        """x: (..., Tp) padded signal -> (..., F, K) complex."""
         frames = x.unfold(-1, self.win_len, self.hop) * self.win
         return torch.fft.rfft(frames, n=self.nfft, dim=-1, norm="ortho")
 
     def synthesis(self, c, Tp):
-        """c: (B, F, K) complex -> (B, Tp) real (overlap-add)."""
+        """c: (..., F, K) complex -> (..., Tp) real (overlap-add)."""
         frames = torch.fft.irfft(c, n=self.nfft, dim=-1, norm="ortho")[..., : self.win_len] * self.win
         return overlap_add(frames, self.hop, Tp)
 
 
 def overlap_add(frames, hop, Tp):
-    """frames: (B, F, W) with W a multiple of hop -> (B, Tp). Much faster than F.fold on CPU."""
-    B, F, W = frames.shape
+    """frames: (..., F, W) with W a multiple of hop -> (..., Tp). Much faster than F.fold on CPU."""
+    *lead, F, W = frames.shape
     R = W // hop
-    fr = frames.reshape(B, F, R, hop)
-    out = torch.zeros(B, F + R - 1, hop, dtype=frames.dtype, device=frames.device)
+    fr = frames.reshape(*lead, F, R, hop)
+    out = torch.zeros(*lead, F + R - 1, hop, dtype=frames.dtype, device=frames.device)
     for j in range(R):
-        out[:, j:j + F] += fr[:, :, j]
-    out = out.reshape(B, (F + R - 1) * hop)
-    if out.shape[1] < Tp:
-        out = Fnn.pad(out, (0, Tp - out.shape[1]))
-    return out[:, :Tp]
+        out[..., j:j + F, :] += fr[..., j, :]
+    out = out.reshape(*lead, (F + R - 1) * hop)
+    if out.shape[-1] < Tp:
+        out = Fnn.pad(out, (0, Tp - out.shape[-1]))
+    return out[..., :Tp]

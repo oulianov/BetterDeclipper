@@ -94,6 +94,57 @@ def _model_kwargs(kind, win_ms, sr, extra):
     return kw
 
 
+def _lam_ref(y, scale, Q, W, sr, device):
+    """File-global lambda reference of the PnP models: max |STFT coefficient| of the normalized,
+    channel-rotated signal (Q: torch (C, C)), blockwise to bound memory."""
+    st = TightSTFT(W, W // 4, device=device)
+    u = torch.einsum("ji,tj->it", Q, torch.as_tensor(y / scale, dtype=torch.float32, device=device))
+    zmax = 0.0
+    for a in range(0, y.shape[0], 60 * sr):
+        seg = u[:, a:a + 60 * sr + W]
+        if seg.shape[1] >= W:
+            zmax = max(zmax, float(torch.abs(st.analysis(seg)).max()))
+    return zmax
+
+
+def _consistent(out, y, m_hi, m_lo, th_hi, th_lo, gcap=None):
+    """Exact consistency: reliable samples untouched, flagged samples beyond their threshold (and within
+    the gain cap)."""
+    clipped = m_hi | m_lo
+    out[~clipped] = y[~clipped]
+    out = np.where(m_hi, np.maximum(out, full_thresholds(th_hi, out.shape)), out)
+    out = np.where(m_lo, np.minimum(out, full_thresholds(th_lo, out.shape)), out)
+    if gcap is not None:
+        with np.errstate(invalid="ignore"):
+            ub = np.where(np.isinf(gcap), np.inf, gcap * full_thresholds(th_hi, out.shape))
+            lb = np.where(np.isinf(gcap), -np.inf, gcap * full_thresholds(th_lo, out.shape))
+        out = np.where(m_hi, np.minimum(out, ub), out)
+        out = np.where(m_lo, np.maximum(out, lb), out)
+    return out
+
+
+def _first_pass(items, sr, device, n_iter):
+    """The analysis restoration of equally long windows [(y, (m_hi, m_lo, th_hi, th_lo))] that fit in one
+    chunk, as one batched solve: the same as declip(y, sr, models=[("nmf", 93, dict(n_iter=n_iter))],
+    constraints=...) per window, without a solve (and its GPU setup and sync) per window."""
+    out = [y for y, _ in items]
+    todo = [i for i, (_, (m_hi, m_lo, _, _)) in enumerate(items) if (m_hi | m_lo).any()]
+    if not todo:
+        return out
+    W = nice_len(93e-3 * sr)
+    ys = [items[i][0] for i in todo]
+    m_his, m_los, th_his, th_los = zip(*(items[i][1] for i in todo))
+    lam = [_lam_ref(y, threshold_scale(th, tl),
+                    torch.as_tensor(channel_mixing(y, "pca" if y.shape[1] == 2 else "none"), dtype=torch.float32,
+                                    device=device), W, sr, device)
+           for y, th, tl in zip(ys, th_his, th_los)]
+    ests = declip_pnp(ys, list(m_his), list(m_los), list(th_his), list(th_los), sr=sr, lam_ref=lam, device=device,
+                      **_model_kwargs("nmf", 93, sr, dict(n_iter=n_iter)))
+    for i, est in zip(todo, ests):
+        out[i] = _consistent(est, items[i][0], *items[i][1])
+    return out
+
+
 def _chunks(T, chunk, ctx, fade):
     """Yield (a, b, ia, ib): processing span [a,b) and kept interior [ia,ib) (with fade overlap).
     A short tail (< chunk/2) is merged into the previous chunk."""
@@ -200,10 +251,13 @@ def declip(y, sr, preset="normal", levels=None, chunk_s=20.0, ctx_s=1.5, fade_s=
         raise ValueError("a saved analysis applies to modes auto/hard/soft/limiter without forced levels/knees")
     elif mode in ("auto", "hard", "soft", "limiter") and levels is None and knees is None:
         # ceiling analysis (clip plateau / limiter / smeared ceiling) + soft-shoulder knee (first pass)
-        def run_fast(yy, cons):  # analysis pass: 80 NMF iterations give the same knees as 150
-            xx, _ = declip(yy, sr, models=[("nmf", 93, dict(n_iter=80))], constraints=cons, device=device,
-                           verbose=False, chunk_s=chunk_s, ctx_s=ctx_s, fade_s=fade_s)
-            return xx
+        def run_fast(items):  # analysis pass: 80 NMF iterations give the same knees as 150
+            T0 = len(items[0][0])
+            if (len(items) > 1 and all(len(yy) == T0 for yy, _ in items)
+                    and len(list(_chunks(T0, int(chunk_s * sr), 0, 2))) == 1):  # equal one-chunk windows
+                return _first_pass(items, sr, device, n_iter=80)
+            return [declip(yy, sr, models=[("nmf", 93, dict(n_iter=80))], constraints=cons, device=device,
+                           verbose=False, chunk_s=chunk_s, ctx_s=ctx_s, fade_s=fade_s)[0] for yy, cons in items]
         m_hi, m_lo, th_hi, th_lo, rep = auto_constraints(y, lsb, run_fast, mode=mode, sr=sr, analysis=analysis,
                                                          search=full_analysis)
         gcap = rep.pop("gcap", None)
@@ -244,15 +298,7 @@ def declip(y, sr, preset="normal", levels=None, chunk_s=20.0, ctx_s=1.5, fade_s=
     lam_refs = {}
     for kind, win_ms, extra in models:
         if kind in ("pnp", "nmf") and win_ms not in lam_refs:
-            W = nice_len(win_ms * 1e-3 * sr)
-            st = TightSTFT(W, W // 4, device=device)
-            u = torch.einsum("ji,tj->it", Q, torch.as_tensor(y / scale, dtype=torch.float32, device=device))
-            zmax = 0.0
-            for a in range(0, T, 60 * sr):  # blockwise to bound memory
-                seg = u[:, a:a + 60 * sr + W]
-                if seg.shape[1] >= W:
-                    zmax = max(zmax, float(torch.abs(st.analysis(seg)).max()))
-            lam_refs[win_ms] = zmax
+            lam_refs[win_ms] = _lam_ref(y, scale, Q, nice_len(win_ms * 1e-3 * sr), sr, device)
     chunk, ctx, fade = int(chunk_s * sr), int(ctx_s * sr), max(2, int(fade_s * sr))
     spans = list(_chunks(T, chunk, ctx, fade))
     n_steps = sum(1 if kind in ("spade", "ar") else len(spans) for kind, _, _ in models)
@@ -306,17 +352,7 @@ def declip(y, sr, preset="normal", levels=None, chunk_s=20.0, ctx_s=1.5, fade_s=
             wsum[ia:ib] += wt
             tick()
         ests.append(acc / np.maximum(wsum, 1e-12)[:, None])
-    out = fuse(y, ests, wts, wts_hi, sr)
+    out = _consistent(fuse(y, ests, wts, wts_hi, sr), y, m_hi, m_lo, th_hi, th_lo, gcap)
     del ests
-    # exact consistency: reliable samples untouched, clipped samples beyond the clip level
-    out[~clipped] = y[~clipped]
-    out = np.where(m_hi, np.maximum(out, full_thresholds(th_hi, out.shape)), out)
-    out = np.where(m_lo, np.minimum(out, full_thresholds(th_lo, out.shape)), out)
-    if gcap is not None:
-        with np.errstate(invalid="ignore"):
-            ub = np.where(np.isinf(gcap), np.inf, gcap * full_thresholds(th_hi, out.shape))
-            lb = np.where(np.isinf(gcap), -np.inf, gcap * full_thresholds(th_lo, out.shape))
-        out = np.where(m_hi, np.minimum(out, ub), out)
-        out = np.where(m_lo, np.maximum(out, lb), out)
     info["time"] = time.time() - t_start
     return (out[:, 0] if mono else out), info

@@ -10,17 +10,28 @@ reaches every peak's full reduction smoothly. A decaying hold then adds a short 
 release after it. Gains are in dB; the passes repeat until the ceiling holds.
 """
 import numpy as np
+import torch
+import torch.nn.functional as Fnn
 from scipy.ndimage import maximum_filter1d, uniform_filter1d
-from scipy.signal import resample_poly
+from scipy.signal import firwin
 
 OVERSAMPLE = 4
 
 
-def true_peak_envelope(x, oversample=OVERSAMPLE):
-    """Per-sample true peak (T,): max |x| over channels and over each sample's oversampled interval."""
-    up = np.abs(resample_poly(x, oversample, 1, axis=0)).max(axis=1)
-    T = x.shape[0]
-    return np.maximum(up[: T * oversample].reshape(T, oversample).max(axis=1), np.abs(x).max(axis=1))
+def true_peak_envelope(x, oversample=OVERSAMPLE, device="cpu"):
+    """Per-sample true peak (T,): max |x| over channels and over each sample's oversampled interval.
+
+    The interpolation is scipy's resample_poly(x, oversample, 1) (its Kaiser-windowed sinc filter), run as
+    one polyphase convolution on `device`: oversampled sample oversample * n + p is
+    sum_i h[oversample * i + p] x[n + 10 - i]."""
+    device = torch.device(device)
+    dtype = torch.float32 if device.type == "mps" else torch.float64  # MPS has no float64
+    h = np.zeros(21 * oversample)
+    h[: 20 * oversample + 1] = oversample * firwin(20 * oversample + 1, 1.0 / oversample, window=("kaiser", 5.0))
+    phases = torch.as_tensor(h.reshape(21, oversample).T[:, ::-1].copy(), dtype=dtype, device=device)
+    xt = torch.as_tensor(np.asarray(x).T, dtype=dtype, device=device)
+    up = Fnn.conv1d(xt[:, None], phases[:, None], padding=10).abs_().amax((0, 1))
+    return torch.maximum(up, xt.abs().amax(0)).cpu().numpy().astype(np.float64)
 
 
 def _decaying_hold(r, k):
@@ -38,8 +49,10 @@ def _decaying_hold(r, k):
     return out
 
 
-def limit_true_peak(x, sr, ceiling_db=-0.1, lookahead_ms=1.5, attack_ms=2.0, release_ms=30.0, max_passes=4):
-    """Limit x (T, C) or (T,) to a true-peak ceiling in dBTP. Returns (limited x, max gain reduction in dB)."""
+def limit_true_peak(x, sr, ceiling_db=-0.1, lookahead_ms=1.5, attack_ms=2.0, release_ms=30.0, max_passes=4,
+                    device="cpu"):
+    """Limit x (T, C) or (T,) to a true-peak ceiling in dBTP. Returns (limited x, max gain reduction in dB).
+    device: where the oversampled peaks are computed (the slow part), e.g. 'cuda'."""
     x = np.asarray(x, dtype=np.float64)
     mono = x.ndim == 1
     if mono:
@@ -50,7 +63,7 @@ def limit_true_peak(x, sr, ceiling_db=-0.1, lookahead_ms=1.5, attack_ms=2.0, rel
     total = np.zeros(x.shape[0])
     for _ in range(max_passes):
         # the 1e-3 dB margin keeps the interpolated peaks of the next pass under the ceiling
-        need = np.maximum(20 * np.log10(np.maximum(true_peak_envelope(x), 1e-12)) - ceiling_db + 1e-3, 0.0)
+        need = np.maximum(20 * np.log10(np.maximum(true_peak_envelope(x, device=device), 1e-12)) - ceiling_db + 1e-3, 0.0)
         if need.max() <= 1e-3:
             break
         r = uniform_filter1d(maximum_filter1d(need, size=2 * L + 1), size=2 * L + 1)
