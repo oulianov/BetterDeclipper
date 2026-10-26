@@ -18,6 +18,7 @@ torch.set_flush_denormal(True)  # denormals are extremely slow on older x86 CPUs
 from .detect import detect_clip_levels, clip_masks, estimate_lsb, detect_knee
 from .auto import auto_constraints
 from .methods.common import full_thresholds, threshold_scale
+from .methods.janssen import ar_refine
 from .methods.pnp import declip_pnp
 from .methods.spade import declip_spade
 from .methods.social import channel_mixing
@@ -39,7 +40,8 @@ def nice_len(n):
 # in the model options sets its share in the (convex) fusion; default equal weights. Optional
 # "weight_hi" sets a different share above FUSION_XOVER_HZ (two-band fusion, see fuse()).
 # nmf: plug-and-play with an NMF-Wiener denoiser (low-rank spectrogram model, rank ~0.3 x frames);
-# pnp: plug-and-play with PEW social shrinkage; spade: stereo A-SPADE (eps/s scale with the window).
+# pnp: plug-and-play with PEW social shrinkage; spade: stereo A-SPADE (eps/s scale with the window);
+# ar: multi-pass least-squares AR interpolation (window = AR fit length around each clipped segment).
 # Above FUSION_XOVER_HZ only the NMF model is used: SPADE (and PEW) add spiky high-frequency errors in long
 # clipped gaps (audible clicks) while their gain is in the low/mid range (research/LOG.md, session 4).
 PRESETS = {
@@ -82,6 +84,8 @@ def _model_kwargs(kind, win_ms, sr, extra):
     elif kind == "nmf":
         kw = dict(win_len=W, hop=W // 4, n_iter=400, stereo="pca", den_type="nmf", nmf_rank=128, nmf_rank_ratio=0.3, nmf_iter=1,
                   gain_mode="wiener")
+    elif kind == "ar":
+        kw = dict(fit_ms=win_ms)
     else:
         r = W / 4096.0
         kw = dict(win_len=W, hop=W // 4, variant="a", s=max(1, int(round(8 * r))), eps=3.0 * math.sqrt(r),
@@ -251,7 +255,7 @@ def declip(y, sr, preset="normal", levels=None, chunk_s=20.0, ctx_s=1.5, fade_s=
             lam_refs[win_ms] = zmax
     chunk, ctx, fade = int(chunk_s * sr), int(ctx_s * sr), max(2, int(fade_s * sr))
     spans = list(_chunks(T, chunk, ctx, fade))
-    n_steps = sum(1 if kind == "spade" else len(spans) for kind, _, _ in models)
+    n_steps = sum(1 if kind in ("spade", "ar") else len(spans) for kind, _, _ in models)
     step = [0]
 
     def tick():
@@ -270,6 +274,11 @@ def declip(y, sr, preset="normal", levels=None, chunk_s=20.0, ctx_s=1.5, fade_s=
         if kind == "spade":
             # frame-wise and independent per frame: one pass over the whole file (internally batched)
             ests.append(declip_spade(y, m_hi, m_lo, th_hi, th_lo, device=device, **kw))
+            tick()
+            continue
+        if kind == "ar":
+            # segment-wise over the whole file (each clipped segment only needs its AR fit window)
+            ests.append(ar_refine(y, y, m_hi, m_lo, th_hi, th_lo, sr, **kw))
             tick()
             continue
         # global (per-chunk) models: overlapping chunks with context, crossfaded interiors

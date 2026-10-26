@@ -92,7 +92,7 @@ python -m betterdeclipper input.wav output.wav                 # same, without i
 python -m betterdeclipper input.wav                            # -> "input [auto clip+soft normal].wav"
 python -m betterdeclipper input.wav output.wav --preset best   # slowest, most accurate
 python -m betterdeclipper input.flac output.wav --clip-level -12   # force the clip level (dBFS)
-python -m betterdeclipper in.wav out.wav --format pcm24 --normalize -0.1
+python -m betterdeclipper in.wav out.wav --format pcm24 --limit -0.1   # keeps the input's loudness
 python -m betterdeclipper in.wav --save-analysis                # also writes "in.analysis.json"
 python -m betterdeclipper in.wav --preset best --load-analysis in.analysis.json   # skips the analysis
 ```
@@ -110,7 +110,10 @@ python -m betterdeclipper in.wav --preset best --load-analysis in.analysis.json 
   by ear that it fits; the printout says that the levels come from another file. The file is JSON, and
   its values (e.g. the knee) may be edited.
 - Output is 32-bit float by default: restored peaks can exceed the clip level (and even 0 dBFS
-  when the input was clipped at full scale). For PCM output, use `--normalize` or `--gain`.
+  when the input was clipped at full scale). For PCM output, use `--limit` (a true-peak limiter that
+  only turns down the restored peaks, so the output keeps the input's loudness, like RX De-clip's
+  post-limiter), `--normalize` (scales the whole file, so it loses as much loudness as the peaks gained)
+  or `--gain`.
 - Any sample rate works (window lengths are defined in milliseconds).
 - `--clip-level` forces a hard-clip level, and `--knee` forces a soft-clip knee (both skip the analysis).
 - **Modes** (`--mode`, default `auto`). `auto` first analyzes how the master was clipped or limited,

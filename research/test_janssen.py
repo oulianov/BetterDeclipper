@@ -11,5 +11,5 @@ print("pilot sdr", sdr(gt, pilot))
 for kw in json.loads(sys.argv[2]):
     t0 = time.time()
     cb = lambda o, x: print(f"   outer {o}: {sdr(gt, x):.3f}", flush=True)
-    est = ar_refine(cl, pilot, m_hi, m_lo, th_hi, th_lo, callback=cb, **kw)
+    est = ar_refine(cl, pilot, m_hi, m_lo, th_hi, th_lo, sr, callback=cb, **kw)
     print(kw, f"sdr {sdr(gt, est):.3f}  ({time.time()-t0:.0f}s)", flush=True)

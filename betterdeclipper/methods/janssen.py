@@ -1,101 +1,194 @@
-"""AR (Janssen-style) refinement of a declipped estimate.
+"""AR (Janssen / LSAR) restoration of clipped samples.
 
-For overlapping windows, an AR(p) model is fitted to the current estimate (autocorrelation
-method), then the clipped samples of the window are re-estimated by minimizing the AR
-prediction-error energy subject to the clipping constraints (box-constrained QP solved with
-FISTA, batched over all windows via grouped conv1d). Windows are merged by weighted overlap-add.
-Reference: A. Janssen, R. Veldhuis, L. Vries, "Adaptive interpolation of discrete-time signals
-that can be modeled as autoregressive processes", IEEE TASSP 1986.
+The flagged samples are re-estimated from an autoregressive (AR) model of their surroundings: they are
+chosen to minimize the AR prediction-error energy (least-squares AR interpolation, LSAR), subject to the
+clipping constraints (a sample clipped high is at least its clip level, ...). Like iZotope RX's De-clip,
+several passes refit the AR model on the previous estimate with a growing order; unlike it, every pass
+stays consistent with the clipping constraints.
+
+Flagged runs closer than the AR order interact and are solved together as one segment. For a segment with
+unknown samples u and known samples k, the normal equations are (R_a)_uu x_u = -(R_a)_uk x_k, where R_a is
+the (banded Toeplitz) autocorrelation matrix of the AR polynomial. Segments are solved exactly in batches
+of similar size; the bounds are enforced with an active-set loop.
+References: A. Janssen, R. Veldhuis, L. Vries, "Adaptive interpolation of discrete-time signals that can be
+modeled as autoregressive processes", IEEE TASSP 1986; S. Godsill, P. Rayner, "Digital Audio Restoration", 1998.
 """
-import math
 import numpy as np
-import torch
-import torch.nn.functional as Fnn
-from scipy.linalg import solve_toeplitz
+from scipy.signal import fftconvolve
+
+from .common import make_bounds
+
+ORDERS = (64, 128, 256)  # one pass per order
+FIT_MS = 60.0            # AR fit window around each segment (RX: 60 ms)
+LAG_HZ = 5.0             # Gaussian lag window (bandwidth expansion) for numerical robustness
+WNC = 1e-6               # white-noise correction of the autocorrelation
+MAX_UNKNOWNS = 512       # segment size limit; longer clusters are split between runs
+MAX_RUN = 2048           # longer runs are left to the pilot estimate (AR cannot bridge them)
+_BATCH_ELEMS = 1 << 23   # dense-solve batch size limit (B * M * M)
 
 
-def _ar_coeffs(frames, order, lag_win=True, wnc=1e-6):
-    """frames: (N, W) numpy (already windowed). Returns (N, order+1) AR polynomials [1, a1..ap]."""
-    N, W = frames.shape
-    nfft = 1 << int(math.ceil(math.log2(2 * W)))
-    F = np.fft.rfft(frames, n=nfft, axis=1)
+def _next_pow2(n):
+    return np.left_shift(1, np.ceil(np.log2(np.maximum(n, 2))).astype(np.int64))
+
+
+def _segments(miss, order):
+    """Clusters of flagged runs in one channel: (start, end) spans holding at most MAX_UNKNOWNS flagged
+    samples, merging runs separated by at most `order` reliable samples."""
+    d = np.diff(np.concatenate([[0], miss.view(np.int8), [0]]))
+    st, en = np.flatnonzero(d == 1), np.flatnonzero(d == -1)
+    segs = []
+    i = 0
+    while i < len(st):
+        n = en[i] - st[i]
+        j = i
+        while j + 1 < len(st) and st[j + 1] - en[j] <= order and n + en[j + 1] - st[j + 1] <= MAX_UNKNOWNS:
+            j += 1
+            n += en[j] - st[j]
+        if n <= MAX_RUN:
+            segs.append((int(st[i]), int(en[j])))
+        i = j + 1
+    return segs
+
+
+def _windows(x, centers, length):
+    """Rows of x (1-D) of the given length centered on `centers`, zero outside the signal."""
+    idx = centers[:, None] - length // 2 + np.arange(length)[None, :]
+    ok = (idx >= 0) & (idx < len(x))
+    return np.where(ok, x[np.clip(idx, 0, len(x) - 1)], 0.0)
+
+
+def _levinson(r, order):
+    """Batched Levinson-Durbin: autocorrelations r (B, order+1) -> AR polynomials [1, a1..ap] (B, order+1)."""
+    B = r.shape[0]
+    a = np.zeros((B, order + 1))
+    a[:, 0] = 1.0
+    err = r[:, 0].copy()
+    for i in range(1, order + 1):
+        acc = r[:, i] + np.einsum("bj,bj->b", a[:, 1:i], r[:, i - 1:0:-1])
+        k = -acc / np.maximum(err, 1e-30)
+        a[:, 1:i] += k[:, None] * a[:, i - 1:0:-1]
+        a[:, i] = k
+        err *= 1.0 - k * k
+    return a
+
+
+def _ar_fit(frames, order, sr):
+    """AR polynomials of Hann-windowed frames (B, W), with lag window and white-noise correction.
+    Returns the autocorrelation of each polynomial, ra (B, order+1): (R_a)_ij = ra[|i - j|]."""
+    W = frames.shape[1]
+    nfft = _next_pow2(2 * W)
+    F = np.fft.rfft(frames * np.hanning(W + 2)[1:-1], n=nfft, axis=1)
     r = np.fft.irfft(np.abs(F) ** 2, n=nfft, axis=1)[:, : order + 1]
-    if lag_win:
-        # Gaussian lag window (bandwidth expansion) for numerical robustness
-        k = np.arange(order + 1)
-        r = r * np.exp(-0.5 * (2 * np.pi * 5.0 * k / 44100.0) ** 2)[None, :]
-    A = np.zeros((N, order + 1))
-    A[:, 0] = 1.0
-    for i in range(N):
-        ri = r[i].copy()
-        if ri[0] <= 1e-12:
+    k = np.arange(order + 1)
+    r = r * np.exp(-0.5 * (2 * np.pi * LAG_HZ * k / sr) ** 2)[None, :]
+    r[:, 0] = r[:, 0] * (1.0 + WNC) + 1e-20
+    a = _levinson(r, order)
+    na = _next_pow2(2 * (order + 1))
+    return np.fft.irfft(np.abs(np.fft.rfft(a, n=na, axis=1)) ** 2, n=na, axis=1)[:, : order + 1]
+
+
+def _solve_box(G, b, lb, ub, valid, max_iter=30):
+    """Batched min 1/2 x'Gx - b'x subject to lb <= x <= ub (active set). Padded entries (valid False)
+    are pinned at zero."""
+    pinned = ~valid
+    at_lb = np.zeros_like(valid)
+    at_ub = np.zeros_like(valid)
+    xf = np.zeros_like(b)                                   # values of fixed entries
+    eye = np.eye(G.shape[1], dtype=bool)[None]
+    for _ in range(max_iter):
+        fixed = pinned | at_lb | at_ub
+        rhs = np.where(fixed, xf, b - np.einsum("bij,bj->bi", G, np.where(fixed, xf, 0.0)))
+        Gm = np.where(fixed[:, :, None] | fixed[:, None, :], eye, G)
+        x = np.linalg.solve(Gm, rhs[..., None])[..., 0]
+        lo = valid & ~fixed & (x < lb)
+        hi = valid & ~fixed & (x > ub)
+        if lo.any() or hi.any():
+            at_lb |= lo
+            at_ub |= hi
+            xf = np.where(lo, lb, np.where(hi, ub, xf))
             continue
-        ri[0] *= 1.0 + wnc
-        a = solve_toeplitz((ri[:order], ri[:order]), -ri[1: order + 1])
-        A[i, 1:] = a
-    return A
+        # feasible: release bounds whose multiplier has the wrong sign (the cost decreases inward)
+        g = np.einsum("bij,bj->bi", G, x) - b
+        rel_lb = at_lb & (g < 0)
+        rel_ub = at_ub & (g > 0)
+        if not (rel_lb.any() or rel_ub.any()):
+            break
+        at_lb &= ~rel_lb
+        at_ub &= ~rel_ub
+    return np.clip(x, lb, ub)
 
 
-def ar_refine(y, x0, m_hi, m_lo, th_hi, th_lo, win_len=2048, hop=512, order=256, n_outer=3,
-              n_inner=100, device="cpu", dtype=torch.float32, callback=None):
-    """y, x0: (T, C). Returns refined (T, C) estimate (consistent with the clipping constraints)."""
-    T, C = y.shape
-    lb = np.where(m_hi, th_hi[None, :], np.where(m_lo, -np.inf, y))
-    ub = np.where(m_lo, th_lo[None, :], np.where(m_hi, np.inf, y))
-    miss = (m_hi | m_lo)
-    pad = win_len
-    Tp = T + 2 * pad
-    Tp += (hop - (Tp - win_len) % hop) % hop
-    def padarr(a, v):
-        out = np.full((Tp, C), v, dtype=np.float64)
-        out[pad:pad + T] = a
-        return out
-    x = padarr(x0, 0.0)
-    LB = padarr(lb, 0.0); UB = padarr(ub, 0.0); MS = padarr(miss, False).astype(bool)
-    starts = np.arange(0, Tp - win_len + 1, hop)
-    idx = starts[:, None] + np.arange(win_len)[None, :]         # (nW, W)
-    # only windows containing clipped samples matter
-    wsel = [np.where(MS[idx, c].any(axis=1))[0] for c in range(C)]
-    wa = np.hanning(win_len + 2)[1:-1]
-    for outer in range(n_outer):
-        xn = x.copy()
-        acc = np.zeros((Tp, C)); wacc = np.zeros((Tp, C))
-        for c in range(C):
-            ws = wsel[c]
-            if ws.size == 0:
-                continue
-            I = idx[ws]                                      # (n, W)
-            V = x[I, c]                                      # current estimate frames
-            A = _ar_coeffs(V * wa[None, :], order)           # (n, p+1)
-            vt = torch.as_tensor(V, dtype=dtype, device=device)
-            lbt = torch.as_tensor(LB[I, c], dtype=dtype, device=device)
-            ubt = torch.as_tensor(UB[I, c], dtype=dtype, device=device)
-            mt = torch.as_tensor(MS[I, c], dtype=torch.bool, device=device)
-            at = torch.as_tensor(A, dtype=dtype, device=device)
-            n = at.shape[0]
-            # Lipschitz constant of A^T A per window: max |A(w)|^2
-            Lw = torch.abs(torch.fft.rfft(at, n=4096, dim=-1)).max(-1).values ** 2  # (n,)
-            wconv = at.flip(-1)[:, None, :]                  # conv1d = correlation -> flip for convolution
-            def grad(v):
-                e = Fnn.conv1d(v[None], wconv, groups=n)     # (1, n, W-p): prediction errors (valid)
-                g = Fnn.conv_transpose1d(e, wconv, groups=n)  # (1, n, W)
-                return g[0]
-            proj = lambda v: torch.where(mt, torch.maximum(torch.minimum(v, ubt), lbt), vt)
-            v = vt.clone(); vb = v.clone(); t = 1.0
-            step = (1.0 / Lw)[:, None]
-            for it in range(n_inner):
-                vnew = proj(vb - step * grad(vb))
-                tn = 0.5 * (1 + math.sqrt(1 + 4 * t * t))
-                vb = vnew + ((t - 1) / tn) * (vnew - v)
-                v, t = vnew, tn
-            vv = v.cpu().numpy().astype(np.float64)
-            np.add.at(acc[:, c], I.ravel(), (vv * wa[None, :]).ravel())
-            np.add.at(wacc[:, c], I.ravel(), np.broadcast_to(wa[None, :], vv.shape).ravel())
-        upd = wacc > 1e-9
-        xn[upd] = acc[upd] / wacc[upd]
-        # keep reliable samples exact, clipped samples within bounds
-        xn = np.where(MS, np.clip(xn, LB, UB), x)
-        x = xn
+def _pass(x, miss, lb, ub, order, sr, fit_len):
+    """One LSAR pass over one channel: refit the AR model around each segment on the current estimate x,
+    then re-solve its flagged samples. Updates x in place."""
+    segs = _segments(miss, order)
+    if not segs:
+        return
+    T = len(x)
+    spans = np.array(segs)
+    centers = (spans[:, 0] + spans[:, 1]) // 2
+    seg_len = spans[:, 1] - spans[:, 0]
+    # AR fit windows: fit_len, or longer when the segment and the order on both sides need it
+    ra = np.zeros((len(segs), order + 1))
+    need = seg_len + 4 * order
+    lengths = np.where(need > fit_len, _next_pow2(need), fit_len)
+    for L in np.unique(lengths):
+        sel = np.flatnonzero(lengths == L)
+        ra[sel] = _ar_fit(_windows(x, centers[sel], int(L)), order, sr)
+    # unknowns of each segment, bucketed by count for the dense solves
+    unknowns = [np.flatnonzero(miss[s:e]) + s for s, e in segs]
+    counts = np.array([len(u) for u in unknowns])
+    for M in np.unique(_next_pow2(counts)):
+        sel_all = np.flatnonzero(_next_pow2(counts) == M)
+        step = max(1, _BATCH_ELEMS // (M * M))
+        for c0 in range(0, len(sel_all), step):
+            sel = sel_all[c0:c0 + step]
+            B = len(sel)
+            U = np.zeros((B, M), dtype=np.int64)
+            valid = np.zeros((B, M), dtype=bool)
+            for r, i in enumerate(sel):
+                U[r, : counts[i]] = unknowns[i]
+                valid[r, : counts[i]] = True
+            U = np.where(valid, U, U[:, :1])                 # padded entries are pinned by _solve_box
+            # G = (R_a)_uu
+            D = np.minimum(np.abs(U[:, :, None] - U[:, None, :]), order + 1)
+            ra_ext = np.concatenate([ra[sel], np.zeros((B, 1))], axis=1)
+            G = ra_ext[np.arange(B)[:, None, None], D]
+            # b = -(R_a x~)_u with the unknowns of x~ zeroed
+            S0 = spans[sel, 0] - order
+            S = int((spans[sel, 1] - spans[sel, 0]).max() + 2 * order)
+            seg_idx = S0[:, None] + np.arange(S)[None, :]
+            inside = (seg_idx >= 0) & (seg_idx < T)
+            xt = np.where(inside, x[np.clip(seg_idx, 0, T - 1)], 0.0)
+            rr, cc = np.nonzero(valid)
+            xt[rr, U[rr, cc] - S0[rr]] = 0.0
+            ra_sym = np.concatenate([ra[sel][:, :0:-1], ra[sel]], axis=1)       # lags -p..p
+            conv = fftconvolve(xt, ra_sym, mode="full", axes=1)
+            rel = np.clip(U - S0[:, None] + order, 0, conv.shape[1] - 1)
+            b = -np.take_along_axis(conv, rel, axis=1)
+            Uc = np.clip(U, 0, T - 1)
+            lo = np.where(valid, lb[Uc], -np.inf)
+            hi = np.where(valid, ub[Uc], np.inf)
+            sol = _solve_box(G, np.where(valid, b, 0.0), lo, hi, valid)
+            x[U[valid]] = sol[valid]
+
+
+def ar_refine(y, x0, m_hi, m_lo, th_hi, th_lo, sr, orders=ORDERS, fit_ms=FIT_MS, max_gain=None, callback=None):
+    """Consistent multi-pass LSAR restoration.
+
+    y: clipped input (T, C); x0: starting estimate (T, C), e.g. y itself or another model's output.
+    m_hi, m_lo: flagged samples (T, C); th_hi, th_lo: clip levels, per channel (C,) or per sample (T, C).
+    orders: one pass per AR order (growing orders refine the model on the previous estimate).
+    max_gain: optional cap on |x| / threshold for flagged samples (scalar or (T, C)).
+    Returns the restored (T, C) estimate: reliable samples of y unchanged, flagged samples within bounds."""
+    y = np.asarray(y, dtype=np.float64)
+    lb, ub = make_bounds(y, m_hi, m_lo, th_hi, th_lo, max_gain)
+    miss = (m_hi | m_lo).T
+    x = np.where(miss.T, np.clip(np.asarray(x0, dtype=np.float64), lb.T, ub.T), y).T.copy()
+    fit_len = round(fit_ms * 1e-3 * sr)
+    for n, order in enumerate(orders):
+        for c in range(x.shape[0]):
+            _pass(x[c], miss[c], lb[c], ub[c], int(order), sr, fit_len)
         if callback is not None:
-            callback(outer, x[pad:pad + T])
-    return x[pad:pad + T]
+            callback(n, x.T)
+    return x.T.copy()

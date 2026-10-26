@@ -8,6 +8,7 @@ import soundfile as sf
 from . import __version__
 from .engine import declip, PRESETS
 from .auto import ACC_MIN_FREE, ACC_HINT_FREE, load_analysis, save_analysis
+from .limiter import limit_true_peak
 
 
 def _parse_level(s):
@@ -146,8 +147,13 @@ def main(argv=None):
                          "many dB (built into the constraints, so restored peaks stay smooth)")
     ap.add_argument("--format", choices=["float", "pcm24", "pcm16"], default="float",
                     help="output sample format (default: 32-bit float, keeps restored peaks above 0 dBFS)")
-    ap.add_argument("--normalize", type=float, default=None, metavar="DBFS",
-                    help="scale output so its peak is at this level (e.g. -0.1); recommended with PCM output")
+    level = ap.add_mutually_exclusive_group()
+    level.add_argument("--normalize", type=float, default=None, metavar="DBFS",
+                       help="scale output so its peak is at this level (e.g. -0.1); lowers the loudness by as "
+                            "much as the restored peaks rise")
+    level.add_argument("--limit", type=float, default=None, metavar="DBTP",
+                       help="true-peak limit the restored peaks to this ceiling (e.g. -0.1): keeps the input's "
+                            "loudness; recommended with PCM output")
     ap.add_argument("--gain", type=float, default=0.0, metavar="DB", help="output gain in dB")
     ap.add_argument("--device", default="auto",
                     help="auto (default: CUDA GPU if available, else CPU), cpu, cuda, or cuda:N")
@@ -210,6 +216,9 @@ def main(argv=None):
     if info["clipped_frac"] == 0:
         print("no clipping or limiting detected; output equals input (use --mode soft, --knee or --clip-level to force it)")
     x = x * 10 ** (args.gain / 20)
+    if args.limit is not None:
+        x, reduction = limit_true_peak(x, sr, ceiling_db=args.limit)
+        print(f"true-peak limiter: ceiling {args.limit:+.2f} dBTP, max gain reduction {reduction:.2f} dB")
     peak = np.abs(x).max()
     if args.normalize is not None and peak > 0:
         x = x * (10 ** (args.normalize / 20) / peak)

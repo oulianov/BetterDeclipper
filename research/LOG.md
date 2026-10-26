@@ -310,3 +310,19 @@ fast preset), via file and in memory; 15 benchmark cases bit-identical to mbench
 refactor; another input (album case) is reported as reused, channel mismatch is an error.
 License: GPL-3.0-only (LICENSE = gnu.org gpl-3.0.txt; briefly AGPL-3.0-only on dev, changed so that network
 services such as MVSep may use it without a source obligation), version 0.3.0.
+### Exact multi-pass LSAR, true-peak limiter (2026-10-26)
+methods/janssen.py rewritten after iZotope RX De-clip (threshold mask -> its De-click AR interpolator,
+3 passes with growing orders, no consistency constraint, post-limiter): clipped runs closer than the AR
+order form segments; per segment the AR model is refit (Hann window, 60 ms, batched Levinson) on the
+current estimate and the flagged samples are solved exactly ((R_a)_uu x_u = -(R_a)_uk x_k, batched dense
+solves) with the clipping bounds enforced by an active set; orders (64, 128, 256), one pass each.
+Engine model kind "ar" (not in the presets). Size Up 8 s excerpt, 3 % hard clip, start = clipped input:
+old FISTA ar_refine 25.14 dB / 81.6 s, new 31.23 dB / 2.2 s (RX orders 150/200/300: 31.31 dB).
+Auto-mode benchmark (research/bench_ar.py; Size Up, Olivia Dean, music_with_singing; 3 %, 8 %, 3 % + MP3
+128k; 9 cases): fast beats best in every case (e.g. 34.89 vs 32.81, 25.85 vs 23.94); AR alone is 1-3 dB
+below fast; fast*0.75 + AR*0.25 gains only on Size Up (+0.26 / +0.73) and loses up to 0.24 elsewhere ->
+AR stays out of the presets. AR takes ~7 s per 8 s excerpt (CPU), NMF-150 ~0.8 s (MPS).
+limiter.py / --limit DBTP: linked 4x true-peak limiter (hold + average over 1.5 ms look-ahead, 2 ms
+attack, 30 ms release) instead of --normalize for loud output. blackhole.mp3 (116.6 s, smeared ceiling
+-0.45 dBFS, 1.75 % flagged), fast on MPS 16 s: -9.0 LUFS in, RX 11 De-clip + auto threshold -9.5 LUFS,
+ours with --limit -0.1 -9.5 LUFS at -0.1 dBTP (max reduction 5.4 dB); normalizing instead loses ~4.3 LU.
