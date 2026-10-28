@@ -62,9 +62,8 @@ def limit_true_peak(x, sr, ceiling_db=-0.1, lookahead_ms=1.5, attack_ms=2.0, rel
     k_rel = np.exp(-1.0 / (release_ms * 1e-3 * sr))
     total = np.zeros(x.shape[0])
     for _ in range(max_passes):
-        # the 1e-3 dB margin keeps the interpolated peaks of the next pass under the ceiling
-        need = np.maximum(20 * np.log10(np.maximum(true_peak_envelope(x, device=device), 1e-12)) - ceiling_db + 1e-3, 0.0)
-        if need.max() <= 1e-3:
+        need = np.maximum(20 * np.log10(np.maximum(true_peak_envelope(x, device=device), 1e-12)) - ceiling_db, 0.0)
+        if not need.any():
             break
         r = uniform_filter1d(maximum_filter1d(need, size=2 * L + 1), size=2 * L + 1)
         r = np.maximum(_decaying_hold(r, k_rel), _decaying_hold(r[::-1], k_att)[::-1])
