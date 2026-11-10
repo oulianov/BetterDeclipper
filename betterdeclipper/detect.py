@@ -71,8 +71,15 @@ def detect_clip_levels(y, lsb=None):
 
 
 def estimate_lsb(y):
-    """Estimate the quantization step of y (returns a tiny value for true float audio)."""
-    v = np.abs(np.asarray(y, dtype=np.float64).ravel()[:200000])
+    """Estimate the quantization step of y (returns a tiny value for true float audio).
+
+    Digital silence lies on every grid, so only nonzero samples count, spread over the whole file: a stem
+    that starts silent must not read as 8-bit."""
+    v = np.asarray(y, dtype=np.float64).ravel()
+    v = v[v != 0]
+    v = np.abs(v[:: max(1, v.size // 200000)])
+    if not v.size:
+        return 1e-7
     for bits in (8, 16, 24):
         q = 2.0 ** (bits - 1)
         if np.all(np.abs(v * q - np.round(v * q)) < 1e-6):
@@ -168,6 +175,8 @@ def fit_ceiling(s, lsb=1e-7, lo_frac=0.45, nbins=600, peak_discard=1e-5):
     v = s[(s >= lo) & (s <= peak)]
     bw = max((peak - lo) / nbins, lsb)
     h, e = np.histogram(v, bins=np.arange(lo, peak + bw, bw))
+    if h.size < 5:  # a polarity only a few LSBs tall (near-silent channel): no ceiling to resolve
+        return None
     un = 0.5 * (e[1:] + e[:-1]) / peak
     bwn = bw / peak
     hs = np.convolve(h, np.ones(5) / 5, "same")
